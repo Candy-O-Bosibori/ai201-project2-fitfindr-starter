@@ -19,7 +19,14 @@ Usage (once implemented):
 """
 
 import re
-from tools import search_listings, suggest_outfit, create_fit_card
+from tools import (
+    search_listings,
+    search_listings_with_retry,
+    suggest_outfit,
+    create_fit_card,
+    compare_price,
+    analyze_trends,
+)
 
 
 # ── query parsing ────────────────────────────────────────────────────────────
@@ -90,9 +97,12 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "search_results": [],        # list of matching listing dicts
         "selected_item": None,       # top result, passed into suggest_outfit
         "wardrobe": wardrobe,        # user's wardrobe dict
-        "outfit_suggestion": None,   # string returned by suggest_outfit
+        "outfit_suggestion": None,   # dict returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
+        "trends": None,              # STRETCH: trending styles/colors (analyze_trends result)
+        "price_comparison": None,    # STRETCH: price assessment (compare_price result)
+        "retry_explanation": "",     # STRETCH: what constraints were loosened in search
     }
 
 
@@ -150,14 +160,21 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     parsed = _parse_query(query)
     session["parsed"] = parsed
 
-    # Step 3: Call search_listings() with parsed parameters
-    search_results = search_listings(
+    # STRETCH: Analyze trends early to influence outfit suggestions
+    from utils.data_loader import load_listings
+    trends = analyze_trends(load_listings())
+    session["trends"] = trends
+
+    # Step 3: Call search_listings_with_retry() with parsed parameters (STRETCH: now with retry logic)
+    search_result = search_listings_with_retry(
         style_description=parsed["style_description"],
         size=parsed["size"],
         max_price=parsed["max_price"],
         category=parsed["category"],
     )
+    search_results = search_result["results"]
     session["search_results"] = search_results
+    session["retry_explanation"] = search_result["retry_explanation"]
 
     # If no results found, set error and return early
     if not search_results:
@@ -171,8 +188,12 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     selected_item = search_results[0]
     session["selected_item"] = selected_item
 
-    # Step 5: Call suggest_outfit() with selected item and wardrobe
-    outfit_suggestion = suggest_outfit(selected_item, wardrobe)
+    # STRETCH: Compare price of selected item
+    price_comparison = compare_price(selected_item)
+    session["price_comparison"] = price_comparison
+
+    # Step 5: Call suggest_outfit() with selected item, wardrobe, and trends (STRETCH: pass trends)
+    outfit_suggestion = suggest_outfit(selected_item, wardrobe, trends)
     session["outfit_suggestion"] = outfit_suggestion
 
     # Check if wardrobe was empty (outfit_suggestion will have empty outfit_items)

@@ -105,9 +105,62 @@ def search_listings(
     return [listing for _, listing in scored_listings]
 
 
+def search_listings_with_retry(
+    style_description: str = "",
+    size: str = "",
+    max_price: float = float("inf"),
+    category: str = "",
+) -> dict:
+    """
+    Search listings with automatic retry logic on zero results (STRETCH FEATURE).
+
+    If initial search returns nothing, automatically retries with loosened constraints:
+    1. Remove price filter
+    2. Remove size filter
+    3. Remove category filter
+    At each step, explains to user what was adjusted.
+
+    Returns:
+        A dict containing:
+        - results: List of matching listings (may be empty)
+        - retry_explanation: String explaining what was adjusted (empty if no retries)
+    """
+    results = search_listings(style_description, size, max_price, category)
+
+    if results:
+        return {"results": results, "retry_explanation": ""}
+
+    # Retry 1: Remove price filter
+    results = search_listings(style_description, size, float("inf"), category)
+    if results:
+        return {
+            "results": results,
+            "retry_explanation": "No results with that price limit. Showing all prices instead.",
+        }
+
+    # Retry 2: Remove size filter
+    results = search_listings(style_description, "", float("inf"), category)
+    if results:
+        return {
+            "results": results,
+            "retry_explanation": "No results for that size. Showing all sizes. You can adjust fit details later.",
+        }
+
+    # Retry 3: Remove category filter
+    results = search_listings(style_description, "", float("inf"), "")
+    if results:
+        return {
+            "results": results,
+            "retry_explanation": "No results in that category. Showing matches across all categories.",
+        }
+
+    # Still nothing
+    return {"results": [], "retry_explanation": ""}
+
+
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
 
-def suggest_outfit(new_item: dict, wardrobe: dict) -> dict:
+def suggest_outfit(new_item: dict, wardrobe: dict, trends: dict | None = None) -> dict:
     """
     Analyze how a new item pairs with the user's wardrobe based on color
     and style compatibility.
@@ -162,6 +215,14 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> dict:
             category_bonus = 0.2
 
         score = (color_overlap * 0.4) + (tags_overlap * 0.4) + category_bonus
+
+        # Apply trend boost if trends provided (STRETCH FEATURE)
+        if trends and "trending_tags" in trends:
+            trending_tag_names = [tag for tag, _ in trends["trending_tags"]]
+            wardrobe_tags = set(t.lower() for t in wardrobe_item.get("style_tags", []))
+            if wardrobe_tags & set(trending_tag_names):
+                score += 0.1  # Boost score for trending items
+
         if score > 0:
             scored_items.append((score, wardrobe_item))
 
@@ -196,6 +257,119 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> dict:
         "outfit_items": selected_ids,
         "reasoning": reasoning,
         "complete": is_complete,
+    }
+
+
+# ── Tool 3.5: compare_price (STRETCH) ─────────────────────────────────────────
+
+def compare_price(item: dict) -> dict:
+    """
+    Compare the price of an item against similar items in the dataset.
+
+    Args:
+        item: A listing dict with at minimum: category, price, style_tags.
+
+    Returns:
+        A dict containing:
+        - price_assessment: A readable comparison (e.g., "15% below average")
+        - avg_price: Average price of similar items
+        - percentile: Where this item falls (0-100)
+        - reasoning: Explanation of the comparison
+    """
+    listings = load_listings()
+
+    # Find comparables: same category + 50% style_tag overlap
+    item_category = item.get("category", "").lower()
+    item_tags = set(t.lower() for t in item.get("style_tags", []))
+    item_price = item.get("price", 0)
+
+    comparables = []
+    for listing in listings:
+        if listing["id"] == item["id"]:
+            continue  # Don't compare to itself
+        if listing["category"].lower() != item_category:
+            continue  # Must be same category
+
+        listing_tags = set(t.lower() for t in listing.get("style_tags", []))
+        tag_overlap = len(item_tags & listing_tags) / max(len(item_tags | listing_tags), 1)
+        if tag_overlap >= 0.3:  # At least 30% style match
+            comparables.append(listing["price"])
+
+    if not comparables:
+        return {
+            "price_assessment": "Unique item — no direct comparables in dataset",
+            "avg_price": item_price,
+            "percentile": 50,
+            "reasoning": "This item's style is unique. Price cannot be compared to similar items.",
+        }
+
+    comparables_sorted = sorted(comparables)
+    avg_price = sum(comparables) / len(comparables)
+    median_price = comparables_sorted[len(comparables_sorted) // 2]
+    percentile = (sum(1 for p in comparables if p <= item_price) / len(comparables)) * 100
+
+    # Generate assessment
+    if item_price < avg_price * 0.8:
+        assessment = f"{abs(100 - (item_price / avg_price * 100)):.0f}% below average — great deal!"
+    elif item_price > avg_price * 1.2:
+        assessment = f"{(item_price / avg_price * 100 - 100):.0f}% above average — premium pricing"
+    else:
+        assessment = "Right around average price for this style"
+
+    reasoning = (
+        f"Compared to {len(comparables)} similar {item_category} items with matching style. "
+        f"Average price: ${avg_price:.2f}, Median: ${median_price:.2f}. "
+        f"This item at ${item_price:.2f} is in the {percentile:.0f}th percentile."
+    )
+
+    return {
+        "price_assessment": assessment,
+        "avg_price": avg_price,
+        "percentile": percentile,
+        "reasoning": reasoning,
+    }
+
+
+# ── Tool 3.7: analyze_trends (STRETCH) ────────────────────────────────────────
+
+def analyze_trends(listings: list) -> dict:
+    """
+    Analyze the dataset to identify trending styles and colors.
+
+    Args:
+        listings: List of listing dicts from load_listings().
+
+    Returns:
+        A dict containing:
+        - trending_tags: List of (tag, count) tuples, most common first
+        - trending_colors: List of (color, count) tuples, most common first
+        - summary: A readable trend summary
+    """
+    tag_counts = {}
+    color_counts = {}
+
+    for listing in listings:
+        for tag in listing.get("style_tags", []):
+            tag_lower = tag.lower()
+            tag_counts[tag_lower] = tag_counts.get(tag_lower, 0) + 1
+
+        for color in listing.get("colors", []):
+            color_lower = color.lower()
+            color_counts[color_lower] = color_counts.get(color_lower, 0) + 1
+
+    # Sort by frequency
+    trending_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+    trending_colors = sorted(color_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    # Generate summary
+    top_tags = ", ".join([f"{tag} ({count})" for tag, count in trending_tags[:3]])
+    top_colors = ", ".join([f"{color} ({count})" for color, count in trending_colors[:3]])
+    summary = f"Top styles: {top_tags}. Top colors: {top_colors}."
+
+    return {
+        "trending_tags": trending_tags,
+        "trending_colors": trending_colors,
+        "summary": summary,
     }
 
 
